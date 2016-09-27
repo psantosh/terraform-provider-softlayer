@@ -11,6 +11,9 @@ import (
 	"errors"
 	"github.com/hashicorp/terraform/helper/resource"
 	"github.com/hashicorp/terraform/helper/schema"
+	"github.com/minsikl/netscaler-nitro-go/client"
+	dt "github.com/minsikl/netscaler-nitro-go/datatypes"
+	"github.com/minsikl/netscaler-nitro-go/op"
 	"github.com/softlayer/softlayer-go/datatypes"
 	"github.com/softlayer/softlayer-go/filter"
 	"github.com/softlayer/softlayer-go/helpers/location"
@@ -29,6 +32,7 @@ func resourceSoftLayerLbVpx() *schema.Resource {
 	return &schema.Resource{
 		Create:   resourceSoftLayerLbVpxCreate,
 		Read:     resourceSoftLayerLbVpxRead,
+		Update:   resourceSoftLayerLbVpxUpdate,
 		Delete:   resourceSoftLayerLbVpxDelete,
 		Exists:   resourceSoftLayerLbVpxExists,
 		Importer: &schema.ResourceImporter{},
@@ -132,6 +136,24 @@ func resourceSoftLayerLbVpx() *schema.Resource {
 				Type:     schema.TypeList,
 				Computed: true,
 				Elem:     &schema.Schema{Type: schema.TypeString},
+			},
+
+			"ha_secondary": &schema.Schema{
+				Type:     schema.TypeMap,
+				Optional: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"primary_id": &schema.Schema{
+							Type:     schema.TypeInt,
+							Required: true,
+						},
+
+						"failback": &schema.Schema{
+							Type:     schema.TypeBool,
+							Required: true,
+						},
+					},
+				},
 			},
 		},
 	}
@@ -373,6 +395,154 @@ func prepareHardwareOptions(d *schema.ResourceData, meta interface{}) ([]datatyp
 	return hardwareOpts, nil
 }
 
+func getNitroClient(sess *session.Session, nadcId int) (*client.NitroClient, error) {
+	service := services.GetNetworkApplicationDeliveryControllerService(sess)
+	nadc, err := service.Id(nadcId).GetObject()
+	if err != nil {
+		return nil, fmt.Errorf("Error retrieving netscaler: %s", err)
+	}
+	return client.NewNitroClient("http", *nadc.ManagementIpAddress, dt.CONFIG,
+		"root", *nadc.Password.Password, true), nil
+}
+
+func nitroConfigureHA(sess *session.Session, primaryId int, secondaryId int) error {
+	nClient1, err := getNitroClient(sess, primaryId)
+	if err != nil {
+		return fmt.Errorf("Error getting primary netscaler information ID: %d", primaryId)
+	}
+	nClient2, err := getNitroClient(sess, secondaryId)
+	if err != nil {
+		return fmt.Errorf("Error getting secondary netscaler information ID: %d", secondaryId)
+	}
+
+	// 1. VPX2 : Sync password
+	systemuserReq2 := dt.SystemuserReq{
+		Systemuser: &dt.Systemuser{
+			Username: op.String("root"),
+			Password: op.String(nClient1.Password),
+		},
+	}
+	err = nClient2.Update(&systemuserReq2)
+	if err != nil {
+		return err
+	}
+
+	nClient2.Password = nClient1.Password
+
+	// 2. VPX1 : Register hanode
+	hanodeReq1 := dt.HanodeReq{
+		Hanode: &dt.Hanode{
+			Id:        op.Int(2),
+			Ipaddress: op.String(nClient2.IpAddress),
+		},
+	}
+	err = nClient1.Add(&hanodeReq1)
+	if err != nil {
+		return err
+	}
+
+	// 3. VPX2 : Register hanode
+	hanodeReq2 := dt.HanodeReq{
+		Hanode: &dt.Hanode{
+			Id:        op.Int(2),
+			Ipaddress: op.String(nClient1.IpAddress),
+		},
+	}
+	err = nClient2.Add(&hanodeReq2)
+	if err != nil {
+		return err
+	}
+
+	// 4. VPX1 : Register rpcnode
+	nsrpcnode1 := dt.NsrpcnodeReq{
+		Nsrpcnode: &dt.Nsrpcnode{
+			Ipaddress: op.String(nClient1.IpAddress),
+			Password:  op.String(nClient1.Password),
+		},
+	}
+	err = nClient1.Update(&nsrpcnode1)
+	if err != nil {
+		return err
+	}
+
+	nsrpcnode1.Nsrpcnode.Ipaddress = op.String(nClient2.IpAddress)
+	err = nClient1.Update(&nsrpcnode1)
+	if err != nil {
+		return err
+	}
+
+	// 5. VPX2 : Register rpcnode
+	nsrpcnode2 := dt.NsrpcnodeReq{
+		Nsrpcnode: &dt.Nsrpcnode{
+			Ipaddress: op.String(nClient1.IpAddress),
+			Password:  op.String(nClient1.Password),
+		},
+	}
+	err = nClient2.Update(&nsrpcnode2)
+	if err != nil {
+		return err
+	}
+
+	nsrpcnode2.Nsrpcnode.Ipaddress = op.String(nClient2.IpAddress)
+	err = nClient2.Update(&nsrpcnode2)
+	if err != nil {
+		return err
+	}
+
+	// 6. VPX1 : Sync files
+	hafiles := dt.HafilesReq{
+		Hafiles: &dt.Hafiles{
+			[]string{"all"},
+		},
+	}
+
+	err = nClient1.Add(&hafiles, "action=sync")
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func nitroDeleteHA(sess *session.Session, primaryId int, secondaryId int) error {
+	nClient1, err := getNitroClient(sess, primaryId)
+	if err != nil {
+		return fmt.Errorf("Error getting primary netscaler information ID: %d", primaryId)
+	}
+	nClient2, err := getNitroClient(sess, secondaryId)
+	if err != nil {
+		return fmt.Errorf("Error getting secondary netscaler information ID: %d", secondaryId)
+	}
+
+	passwordOrg := nClient2.Password
+	nClient2.Password = nClient1.Password
+
+	// 1. VPX2 : Delete hanode
+	err = nClient2.Delete(&dt.HanodeReq{}, "2")
+	if err != nil {
+		return err
+	}
+
+	// 2. VPX1 : Delete hanode
+	err = nClient1.Delete(&dt.HanodeReq{}, "2")
+	if err != nil {
+		return err
+	}
+
+	// 3. VPX2 : Update password to the previouse password.
+	systemuserReq2 := dt.SystemuserReq{
+		Systemuser: &dt.Systemuser{
+			Username: op.String("root"),
+			Password: op.String(passwordOrg),
+		},
+	}
+	err = nClient2.Update(&systemuserReq2)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func resourceSoftLayerLbVpxCreate(d *schema.ResourceData, meta interface{}) error {
 	sess := meta.(*session.Session)
 
@@ -585,6 +755,42 @@ func resourceSoftLayerLbVpxRead(d *schema.ResourceData, meta interface{}) error 
 		d.Set("plan", plan)
 	}
 
+	return nil
+}
+
+func resourceSoftLayerLbVpxUpdate(d *schema.ResourceData, meta interface{}) error {
+	sess := meta.(*session.Session)
+
+	if d.HasChange("ha_secondary") {
+		numOfProperties, _ := strconv.Atoi(d.Get("ha_secondary.%").(string))
+		if numOfProperties > 0 {
+			primaryId, err := strconv.Atoi(d.Get("ha_secondary.primary_id").(string))
+			if err != nil {
+				return fmt.Errorf("Not a valid ID, must be an integer: %s", err)
+			}
+			secondaryId, err := strconv.Atoi(d.Id())
+			if err != nil {
+				return fmt.Errorf("Not a valid ID, must be an integer: %s", err)
+			}
+			log.Printf("[INFO] Configuraing HA - Primary device ID :'%d' Secondary device ID: '%d'", primaryId, secondaryId)
+			err = nitroConfigureHA(sess, primaryId, secondaryId)
+			if err != nil {
+				return fmt.Errorf("Error configuraing HA for netscaler: %s", err)
+			}
+		} else {
+			primaryIdstr, _ := d.GetChange("ha_secondary.primary_id")
+			primaryId, err := strconv.Atoi(primaryIdstr.(string))
+			if err != nil {
+				return fmt.Errorf("Not a valid ID, must be an integer: %s", err)
+			}
+			secondaryId, err := strconv.Atoi(d.Id())
+			if err != nil {
+				return fmt.Errorf("Not a valid ID, must be an integer: %s", err)
+			}
+			log.Printf("[INFO] Delete HA - Secondary device ID: '%d'", secondaryId)
+			err = nitroDeleteHA(sess, primaryId, secondaryId)
+		}
+	}
 	return nil
 }
 

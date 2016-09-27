@@ -1,5 +1,6 @@
 package softlayer
 
+/*
 import (
 	"fmt"
 	"log"
@@ -240,3 +241,4 @@ func resourceSoftLayerLbVpxHaDelete(d *schema.ResourceData, meta interface{}) er
 func resourceSoftLayerLbVpxHaExists(d *schema.ResourceData, meta interface{}) (bool, error) {
 	return true, nil
 }
+*/
